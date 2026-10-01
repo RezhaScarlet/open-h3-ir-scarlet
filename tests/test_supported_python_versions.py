@@ -1,9 +1,12 @@
-"""Every module must be parseable by the oldest Python this package claims to support.
+"""Every module must be parseable by the oldest Python this pack claims to support.
 
-`pyproject.toml` declares `requires-python = ">=3.10"`. That is a promise, and it was false: a
-backslash inside an f-string expression is a SyntaxError before 3.12 (PEP 701 relaxed it), so
-`h3ir/repair.py` could not be imported on 3.10 or 3.11 at all. `compile_brief` imports it, so the
-failure was not subtle on those versions — collection died before a single test ran.
+This matters more here than in most packs: the pack runs on whatever Python the user's ComfyUI was
+built with, which is frequently older than the one it was written on, and a pack that will not parse
+is a pack ComfyUI drops off the menu with a traceback nobody can act on.
+
+`pyproject.toml` declares `requires-python = ">=3.10"`. In the compiler that promise was once false:
+a backslash inside an f-string expression is a SyntaxError before 3.12 (PEP 701 relaxed it), so one
+module could not be imported on 3.10 or 3.11 at all, and collection died before a single test ran.
 
 Nothing local could see it. A 3.12 interpreter parses the construct happily, and two attempts to
 detect it from a 3.12 process were both worthless: a grep whose escaping was wrong found nothing,
@@ -41,12 +44,14 @@ def _min_version() -> tuple[int, int]:
 
 
 def _python_files() -> list[pathlib.Path]:
-    out: list[pathlib.Path] = []
-    # The node pack used to be walked here too, because it shipped in this repository and runs on
-    # whatever Python the user's ComfyUI was built with. It is its own repository now and carries
-    # its own copy of this file.
-    for sub in ("h3ir", "tests"):
-        out += [p for p in (REPO / sub).rglob("*.py")]
+    """Every module in the pack, plus the ones beside it.
+
+    The pack's own modules sit at the repository root, because the root is what ComfyUI imports.
+    A `rglob` from there would walk `.venv` and every installed package with it, so the root is
+    globbed one level deep and the subdirectory that holds the rest of the Python is named.
+    """
+    out = [p for p in REPO.glob("*.py")]
+    out += [p for p in (REPO / "tests").rglob("*.py")]
     return sorted(out)
 
 
@@ -81,7 +86,7 @@ def test_no_backslash_inside_an_f_string_expression():
 
 
 def test_every_module_parses():
-    """A cheap guard that nothing in the tree is syntactically broken at all."""
+    """A cheap guard that nothing in the pack is syntactically broken at all."""
     broken = []
     for f in _python_files():
         try:

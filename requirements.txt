@@ -1,8 +1,14 @@
-# Dependencies are declared in pyproject.toml, so there is only one list to keep true.
-# This file exists for anyone whose habit is to reach for it:
+# ComfyUI Manager pip-installs this file on every install of a cloned pack, so it holds exactly what
+# a ComfyUI needs to run these nodes and nothing else. The same list is in pyproject.toml, which is
+# what the ComfyUI Registry reads.
 #
-#   pip install -e ".[dev]"     # runtime + pytest
-#   pip install .               # runtime only
+# The compiler, and no copy of it. `open-h3-ir` brings fastapi, uvicorn, pydantic and tiktoken with
+# it. The nodes still talk to a service over HTTP and need none of that at import time, and the
+# import of the compiler stays lazy for exactly that reason: a missing or half-installed one must
+# never take this pack off ComfyUI's menu.
 #
-# It stays directive-free on purpose, so that there is exactly one list and this file cannot
-# disagree with it.
+# 0.4.0 is the oldest release this pack works against, for two reasons that happen to agree. It is
+# the first one on PyPI. And it is the first to publish contract version 2, which is what
+# `contract.json` beside this file was built against, so anything older meets a mismatch on its
+# first queue.
+open-h3-ir>=0.4.0

@@ -1,267 +1,270 @@
-# Working on OpenH3-IR
+# Working on the OpenH3-IR node pack
 
-**This document is for changing the compiler.** Read it before changing anything. It is the set of
-rules that are not preferences, a map of which file owns what, and an honest list of what is missing.
-There is no install path here, on purpose.
+**This document is for changing the node pack.** Read it before changing anything. It is the set of
+rules that are not preferences, a map of which file owns what, the ComfyUI frontend behaviour that
+was measured rather than assumed, and how to prove a change is really live in a running ComfyUI.
+There is no install path here, on purpose: that is README.md beside this file.
 
-Two neighbours, if one of them is the job instead:
+The compiler is the other half and it is another repository, `open-h3-ir`. This pack depends on the
+published package and carries no copy of it: a compiler bug is fixed and released there, and nothing
+here changes for it. Its own maintainer document is `AGENTS.md` in that repository, and the rules
+about writing briefs, prompts, validators and evaluation all live there.
 
-- **Installing it and making it run:** [HANDOFF.md](HANDOFF.md).
-- **Calling the service from an application:** [docs/calling-the-api.md](docs/calling-the-api.md).
-
-The project is `open-h3-ir`; the import package and the command are both `h3ir`.
-
-The checks to hold your work against, both reproducible with no model and no GPU: `h3ir controls` is
-23/23 in under a tenth of a second, and `pytest -q` is green. The control count is a gate and should
-only move when you deliberately add or remove a control. The test count is not pinned here, because it
-moves every time anyone adds a test and a stale number reads as a regression.
-
-## What this is and where it runs
-
-A local rebuild of MiniMax H3's closed Context-IR stage. Brief in, validated H3 prompt plus the
-asset wiring it is true for, out.
-
-- **Assume the compiler and the GPU are on different machines.** No path or URL is hardcoded
-  outside `config.py`, and ComfyUI is always reached over HTTP, never through the filesystem. Keep
-  it that way. A filesystem shortcut works on a single box and fails silently everywhere else.
-- Reasoning and vision run on whatever `H3IR_LLM_URL` points at. Nothing calls MiniMax.
-- `h3ir doctor` tells you what is actually reachable before you debug anything else, which liveness
-  path answered, which model it will send to and why, and whether that model can read a picture.
-
-## The rules that are not preferences
-
-1. **Never let a model decide structure.** Labels, label order, speaker IDs, cut times, retention
-   markers, task-type prefixes and section order are computed in `plan.py` and emitted by
-   `render.py`. If you find yourself adding a structural instruction to a prompt file, the fix
-   belongs in the planner instead. On the write-first path the model types the whole document, so
-   the two structural things it can still get wrong are corrected in `repair.py` before anything
-   validates it: the label ordinals, and the task-type prefix. Both are re-derived, not checked,
-   and `M16` sits behind the prefix in case there was none to replace.
-2. **The user's words never pass through a model.** Dialogue reaches the output through
-   `{{D1}}` placeholder substitution in `render.py`. If you change that path, `D4` will catch you.
-3. **Never trust the endpoint's structured output.** It is documented in `backend.py` with the
-   measurements: `json_schema` is silently not applied while reasoning is on, and even with it off
-   the grammar constrains shape but not completion or sense. Parse and re-check everything.
-4. **Never degrade silently.** If the model is unreachable the service raises. A caller cannot
-   tell a good IR from a bad one, so quietly producing a worse one is the failure nobody notices.
-5. **Nothing ships on judgement.** See below.
-6. **The deterministic draft is the product floor, not a degraded mode.** `draft.py` builds a
-   complete valid IR with no prose model. The LLM pass is additive. Any validator error, leaked
-   reasoning, or model outage falls back to the draft, so the caller always gets something valid.
-   The draft failing its own validator is the one thing that raises, because it is deterministic
-   and there would be nothing to fall back to. Do not turn this back into retry-until-valid.
-7. **Thinking is per call, not global.** ON for the beat sheet (planning: measured +5.3pp), OFF
-   for extraction, classification and prose (precision: measured −8.5pp). This is contingent on
-   code owning every machine-checkable field. If you ever let the model emit a timecode, turn
-   thinking off for that call.
-8. **Never enable guided decoding without re-reading why it is off.** vLLM #39130 can skip grammar
-   enforcement silently with a reasoning parser active; llama.cpp #20345 reports the converse on
-   this model family. `H3IR_GUIDED_DECODING=1` exists for comparison, not for production.
-9. **The model is deaf. Never ask it about audio.** `analyse_audio` makes no model call. Audio
-   facts are typed metadata plus a real transcript. An invented timbre is worse than none because
-   `<Audio N>` carries no content into the encoder, so the IR text is its only channel.
-10. **Proportionality is part of the bar, and it is an explicit input.** "If I ask for simple, I want
-    simple, if I say go crazy, I want crazy." `brief.creativity` is `restrained | balanced | bold`,
-    default balanced, and it governs exactly one thing: whether the writer may add **content the
-    request never supplied**: a spoken line, a score, on-screen text. It does NOT mean "more shots"
-    or "more camera moves"; putting effort on this dial would be shot-count-as-a-rule one layer above
-    the validator, where nothing catches it. Never infer the setting from the request. That was
-    considered and rejected, because it would be wrong often and the maintainer could not overrule it. An
-    explicit prohibition in the request outranks every position: `bold` on "No dialogue" licenses no
-    dialogue. See `creativity.py` and design doc section 19.
-11. **The request beats the references beats the director, and the ladder is COMPUTED where it can
-    be and STATED where it cannot.** `licence.py` resolves every attribute to the request or to a
-    reference, per attribute, and `compose_brief` states that resolution in the ask. A director
-    profile occupies the residual that block ends on -- "anything neither the request nor the
-    references settles is yours" -- and it is prose, not a schema: a name and a paragraph the caller
-    wrote, placed *underneath* the licence block and the creativity dial with a head that says it
-    overrides neither. That is the owner's shape and it is deliberate: **"not mechanically enforced,
-    just steered"**. Nothing in `director.py` narrows a rotation, suppresses a sentence or refuses a
-    word.
-
-    So the thing to protect is not a checker, it is that **structure stays uninfluenced** (rule 1).
-    Shot count and cut times are the caller's contract when they pin `shots` -- stated in the ask,
-    `T11-shot-count-pinned` as an ERROR if the document disagrees -- and the writer's when they do
-    not, which is what `auto` has always meant. The deterministic floor in `draft.py` never sees a
-    profile at all, and `tests/test_director.py` proves it by compiling the same request twice.
-    One place the two controls touch: when the dial licenses no score the block says so out loud,
-    because a profile describing music that cannot exist is a contradiction *we* placed in the ask
-    -- the trap `Scope.brief_instruction`'s docstring records, arriving from the other direction.
-12. **A rule asserts a decidable fact, never a preference.** The test: could a competent director
-    disagree with it? If they could, it is not a check, at any severity. Shot count is not a
-    defect. Prose quality is not a defect. Whether an edit is good is the maintainer's call and the
-    validator has no access to it. Where a spec sentence constrains something discretionary, narrow
-    the rule to its decidable residue and hold it at **WARN**, because **ERROR is what the fix loop
-    sends back to the model** and a rule that can be argued with must never instruct a rewrite.
-    Section 18 of the design doc records the audit that established this and every rule it changed.
-    Before adding a rule, name its source: a spec line, a measured fact about the model, or a
-    decidable property of the text. "It looked wrong to me" is not one of the three.
-13. **"OpenAI-compatible" names the chat route and almost nothing around it.** Ollama serves no
-    `/health` and its model objects carry four keys; vLLM publishes `max_model_len` and a `root`
-    that makes two ids one model; a gateway can serve chat completions and no model list at all. So
-    a field read off an endpoint needs the server that publishes it named, and the servers that do
-    not publish it handled. The first outside bug report was three symptoms of one fact: this had
-    only ever been run against one box. Every place that has to know the difference lives in
-    `backend.py`, and `tests/test_endpoint_portability.py` pins each one against replicas of what
-    those servers actually return. Nothing above `backend.py` may grow a second such place.
-
-    Two of them generalise past this file. **A capability the model list does not report must not
-    be guessed:** no server says which of its models has a vision tower, so an endpoint serving
-    several is a refusal that names them, never a pick, and `doctor` answers the question by
-    reading a generated picture through the model rather than by inspecting metadata that does not
-    exist. **And a setting nobody sends is a setting nobody has:** `H3IR_LLM_KEY` was configuration,
-    documentation and dead code at once for as long as the only endpoint here wanted no credential.
-
-## Changing a prompt or a template
-
-Prompt text lives in `h3ir/prompts/*.txt` as versioned files precisely so a change is an artifact you
-can score. The loop is:
+## The two things to hold your work against
 
 ```bash
-h3ir controls                                  # must be 23/23 before anything else
-h3ir eval --label my-change --prose prose_shot.v3.txt
-# read the gate; if SHIP-ABLE:
-h3ir baseline --label my-change
+pytest tests                                   # from the repository root, and the path matters
+.venv/bin/python research/contract_falsification.py
 ```
 
-This is not ceremony. It has already caught a change of mine that improved the metric I was
-aiming at while introducing validator errors, and the root cause turned out to be a latent bug
-rather than the prompt. Assume your next confident improvement is the same.
+**`pytest tests`, never a bare `pytest`.** This repository's root IS the pack, so it holds an
+`__init__.py`, and ComfyUI Manager clones it into `custom_nodes` under a name with hyphens in it.
+pytest turns any directory holding an `__init__.py` into a Package and imports that file before
+running anything below it, and it names the module by walking up while each folder is a Python
+identifier -- which `ComfyUI-OpenH3-IR` is not. So it imports as a bare `__init__` with no parent
+package and the first relative import raises, in every test. `tests/pytest.ini` puts the rootdir
+inside `tests`, which only takes effect when the path handed to pytest is inside it, and
+`conftest.py` at the root turns the other invocation into one sentence. Measured on pytest 9.1.1;
+neither `--import-mode=importlib` nor `consider_namespace_packages` nor `--ignore` avoids it.
 
-**Do not add a control exception to make a rule pass.** MiniMax's own published example is the
-control; if a rule fires on it, the rule is wrong. That is how the 350-word floor and the closed
-camera vocabulary became guidance rather than law, and later the shot-citation check, which
-fired on their example because a persistent setting legitimately is not re-cited every shot.
+The test count is not pinned here, because it moves every time anyone adds a test and a stale number
+reads as a regression.
 
-**A metric reads the artifact that SHIPS, never an intermediate.** In the write-first path `doc.plan`
-is the *deterministic draft's* plan (the model's prose never goes back into it), so anything reading
-`plan.shots` is scoring an object that was thrown away, and it fails silently: the number is
-plausible, nothing raises. Three fields were caught doing it in one evening (`restatement` reporting
-1.00 on visibly different shots, `n_shots` reporting 4 against 0 timed cuts, and `_split_written`
-dropping the whole description), plus a fourth in a script written *after* the other three were fixed.
+**The tests need `open-h3-ir` installed**, at or above the release `requirements.txt` names. Some of
+them read the contract that package publishes and compare it to the copies this pack ships, which is
+the whole point: it holds this pack against the released compiler rather than against a working tree
+nobody has.
 
-**Second half of the same rule: measure it in the CONFIGURATION that ships.** A harness knob whose
-default is anything other than production's turns every run into a truthful report about a pipeline
-nobody uses. `RunConfig.compose_prompt` defaulted to an explicit composer name, overrode the mode
-selection, and reported `clean_rate` 0.167 where the real figure is 1.000. Harder to catch than the
-first half, because a wrong-configuration run is internally consistent.
+## What the README leads with
 
-**And read the artifact back; never trust the code that wrote it.** Four faults found this way,
-including the provenance record that was written to say which pipeline produced a result and recorded
-neither. The field was on the dataclass and missing from the serialiser, and the writing code read
-perfectly.
+The owner's words, 2026-08-23, and they are the pitch rather than a description:
 
-**So: "the number moved" is not evidence until you can name the artifact that produced it.** When you
-add a metric, name a second field it must agree with and check the pair. That is what caught all four,
-and no test caught any of them. `n_shots` vs `n_timed_cuts` must satisfy `shots = cuts + 1` because T4
-enforces it; `restatement` near 1.0 contradicts `shot_distinctness` near 1.0; `words = 0` contradicts
-`errors = 0` because S9 and T1 would both fire. Design doc §24.
+> no more copy pasting prompts from a chat with an llm, no more explaining in what slot a resource
+> is so the llm can name it right, no more explaining what a resource contains, OpenH3-IR takes
+> care of that directly in comfy
 
-**Falsify every test you write. It is not ceremony. It is what distinguishes a test from a
-comment.** Break the code the test covers, on purpose, and watch it go red. Two tests passed a
-deliberate break in one evening, and the two failure modes are different, so know both:
+Every clause of that is a thing this pack actually removes, so none of it is a claim anybody has to
+soften:
 
-- **A fixture that cannot discriminate.** The video frame-distinctness test used a clip generated from
-  a `drawbox` expression that silently rendered nothing, so all three frames were identical 1604-byte
-  images. The assertion compared them and passed. Fixed by using `testsrc`, whose frames must differ.
-- **A cache short-circuiting the code under test.** Breaking `VIDEO_FRAME_FRACTIONS` to `(0.5,0.5,0.5)`
-  left the test green because frames from an earlier correct run were already cached under that key.
-  The cache answered, not the sampler. Fixed by keying the cache on the fractions AND giving the test
-  its own key.
+- **The copy and paste.** The compiler writes the brief. Nobody carries text back from a chat window.
+- **Naming a slot so a model gets the label right.** Labels are computed in the compiler's `plan.py`,
+  never asked for. That is rule one of the codebase and it is why the labels are always right.
+- **Explaining what a file holds.** The reference pictures and clips are read through the language
+  model, so a person says `@carguy` and nothing else.
+- **Leaving ComfyUI to do any of it.** The compiler runs in the same Python ComfyUI runs.
 
-**A cache keyed on its inputs but not on the logic that transformed them will serve stale results
-across a code change and look correct.** That is what `ANALYZER_VERSION` is for, and it has now been
-needed three times (pose split, video frames, audio characterisation) plus once for frame fractions.
-**If a compiled brief is ever cached, the prompt version belongs in the key**, because the compose prompts are
-the transforming logic and they change more often than anything else here.
-
-**A passing control is not proof of correctness.** The rule L5 arrived here as a false positive:
-it flagged every standalone `<Picture N>` line, while the spec forbids them only when the label is
-not separately analysed. It passed the official control the whole time. When you write a rule, also
-write the input that must NOT trip it. `test_hardening.py` has four such cases for G2 alone,
-because my first draft of that rule fired on "he gives an okay sign".
-
-**And a test that has never been seen failing is a test nobody has verified.** This suite shipped one
-that was green for its whole life while the field it guarded was dropped in transit, so every check
-holding the compiler and the pack together has a defect written for it in
-`research/contract_falsification.py`: it plants the defect, proves the defect is live, runs the test
-that claims to catch it, and puts the file back. Run it on a clean tree; 13 cases here, all of which
-must go red. The other 36 are the node pack's, in its own copy of that file, and neither list is
-complete on its own: a guard over there is falsified over there, against the compiler it has
-installed.
-
-**It reports three outcomes, not two, and that distinction is the file's second draft.** RED is a
-guard that fired. GREEN is a guard that did not. BROKEN is a case that never ran -- the anchor
-moved, the write did not land, the edit made the module unimportable, or the test it names no
-longer exists. The first draft printed the same thing for GREEN and BROKEN, and two cases hid in
-that: one named a test that had been renamed, and one planted an unbalanced parenthesis. pytest
-exits non-zero for a `SyntaxError` and for an unknown node id exactly as it does for a failing
-assertion, so both printed RED for months of nothing. **Anything that plants defects has to prove it
-planted them before it is allowed an opinion about the guard.**
-
-Two traps it records rather than works around, because anything editing source in a loop will hit
-them:
-
-  * **Python validates a cached `.pyc` on (mtime, size) and mtime has one-second resolution.** A
-    defect exactly as long as what it replaces, planted within a second of the restore before it,
-    runs against the OLD bytecode. Five cases reported a guard that does not fire before
-    `__pycache__` was wiped between them.
-  * **`python -O` strips `assert`.** The first draft checked its anchors with one, so under `-O` a
-    moved anchor became a silent no-op: nothing was edited, the test passed on untouched source,
-    and the case printed GREEN. Nothing in that file uses `assert` any more.
+Written down here because the README gets its final pass after the Main node lands, and a pitch the
+owner said once in a message is the sort of thing that gets lost between now and then.
 
 ## Where things are
 
+The repository root is the pack. That is not a layout preference: ComfyUI Manager clones a repository
+straight into `custom_nodes` and imports the cloned directory's top level, so anything one folder
+deeper produces zero nodes and no error anybody can act on.
+
+The ComfyUI pack in the repository root is eight Python files plus a `web/` folder of five JS files. Exactly one of them names `h3ir`, and every one of those imports is inside a function. Two files are generated; both say so at the top:
+
 | file | what it owns |
 |---|---|
-| `config.py` | every host-specific value. Nothing else may hardcode one. |
-| `grid.py` | the 17k+5 frame grid and all duration maths. `effective_seconds` vs `nominal_seconds` is a real distinction, so read the docstring. |
-| `tokens.py` | exact token counts using H3's own vocab (vendored under `h3ir/data/`). |
-| `models.py` | the contract. Every stage boundary is a dataclass here. |
-| `backend.py` | the LLM client, the three silent endpoint failures, and every difference between one OpenAI-compatible server and the next. |
-| `analyse.py` | AssetCards, cached on content hash. Audio needs a transcript, see below. |
-| `mode.py` | which of the five modes, and how it fails safe. |
-| `lora.py` | the registry, `howtouse.md` parsing, ingest-time trigger validation. |
-| `plan.py` | all structure. The four solved problems live here. |
-| `prose.py` | the only two places a model writes anything. |
-| `render.py` | deterministic rendering. Must be byte-reproducible. |
-| `validate.py` | the rules. Proved by `evalloop/controls.py` in both directions. |
-| `compile.py` | the orchestrator and the stage order (with the reason for that order). |
-| `director.py` | the third authority: whose taste fills what neither the request nor the references settle. A name and a paragraph, the seven that ship, and the one cap. |
-| `contract.py` | everything that crosses to a client: the wire field names, the roles per kind, every refusal code, the seven directions, the camera table and the limits. Built from the authorities, never restating them. Published by `GET /v1/contract`, by `h3ir contract`, and by import. |
-| `service.py` | the HTTP surface and the three response layers. |
-| `uploads.py` | the content-addressed store behind `PUT /v1/assets/{sha256}`: the digest is computed as the bytes arrive, the ceilings and the age limit come from `config.py`, and eviction is least-recently-used. Write-only by design, so every other method on an asset is a 405. |
-| `comfy.py` | ComfyUI over HTTP; graph prompt substitution that refuses to guess. |
-| `acceptance.py` | the five-arm comparison, built without touching the GPU. |
+| `h3ir_client.py` | the service protocol, the option lists, the report, and the refusal sentences BOTH compile paths use. No ComfyUI, no torch, no third-party packages, no `h3ir`. |
+| `compiler.py` | running the compiler in this Python: is it installed, what does it publish, which language model writes, does that model see, and the compile itself. **The only module that imports `h3ir`.** |
+| `media.py` | tensors and mappings to files on disk, content-addressed. No ComfyUI at module scope. |
+| `nodes.py` | the four node schemas -- Main, Media, Setup and the optional Director -- the model loaders and the socket-to-file mapping. This is the only file that needs a canvas. |
+| `contract.py` | the snapshot of the contract this pack was built against, `Half` (which compiler this graph uses and what to call it), and the decision about what a difference costs: what stops a queue, what is a line in the report. |
+| `contract.json` | GENERATED. `h3ir contract` wrote it. The snapshot the file above reads. |
+| `web/contract.data.js` | GENERATED. `h3ir contract --js` wrote it. The seven profiles, the camera table and the cap, for a panel that has to draw with nothing running. |
+| `web/director.js` | the Director panel. It imports the three above rather than declaring them. See below. |
+| `web/setup.js` | the Setup panel. Two named groups, a bottom row, and the three controls that answer back. |
 
-The ComfyUI node pack is its own repository, [ComfyUI-OpenH3-IR][pack]. It depends on the published
-`open-h3-ir` package, it carries no copy of the compiler, and nothing in this repository imports it
-or reads its files. What used to be written out here -- the pack's own file table, the store its
-directions live in, the ComfyUI frontend behaviour measured rather than assumed, and how to prove a
-change is live in a running ComfyUI -- moved with it, into `AGENTS.md` there.
+**ComfyUI saves a node's widget values as a POSITIONAL list.** Measured on a saved workflow in a real
+install, not assumed: `OpenH3IRSetup` reads back as `["http://127.0.0.1:8420", "<ref2va file>", ...]`
+with no names anywhere. So a new input added in the middle of a schema silently shifts every value
+after it in every workflow anybody has saved, and a checkpoint pick becomes a VAE pick with nothing
+on screen to say why. **New inputs go on the end of `define_schema`, always.** That is why the two
+newest fields on the Setup node, which are also the two most important ones, are last in the list.
+The panel in `web/` lays them out however it likes; the order in the schema is what the bare canvas
+falls back to and what every saved file depends on.
 
-What stayed is the half this side owns: `h3ir/contract.py`, what it publishes, and why every literal
-in it is pinned by `tests/test_contract.py`. Read on.
+**Media, Director and Setup each carry a DOM board; Main is a widget node** the theme draws, with
+`prompt.js` putting an @ picker over its sentence. All of it is decoration in the strict sense: each
+node's real state is ordinary widget values. Media and Director edit ONE string each -- the tray's
+JSON and the direction's -- and Setup edits the ten widgets it already had, keeping the five file
+pickers as real combos underneath so ComfyUI still validates them. Delete `web/` and every node still
+works, still API-drives and still restores from a saved workflow, with the values visible as
+themselves.
 
-[pack]: https://github.com/ruashots/ComfyUI-OpenH3-IR
+**The Director's stored directions are the pack's only piece of state outside a graph, and they are
+deliberately outside the compiler.** They are files in ComfyUI's own per-user store,
+`user/default/openh3ir/directors/<name>.json`, each holding exactly the two keys the node's field
+holds, written and deleted through the `/userdata` routes ComfyUI already serves. The compiler's
+service was the other candidate and it lost on three counts: it may be on another machine or down,
+which would empty the list exactly when somebody is writing in it; it would have needed new write
+routes on a service that binds `0.0.0.0`; and none of it buys anything a graph needs, because **a
+graph carries the words, never a pointer to a name**. Nothing in `nodes.py`, `h3ir_client.py` or the
+service knows the store exists, and that is the property to keep: delete `web/` and every stored
+direction becomes irrelevant rather than missing.
 
-### What crosses to a client, and how drift is made loud
+**The seven that ship are a SEED, not a menu**, and that is the owner's shape: "just preload the
+list with them, they should be able to be removed too." On first use `director.js` writes them into
+that store as ordinary directions, and from then on the list is simply what the store holds. There
+is no shipped category, no protected name, and no branch anywhere that recognises one — which is
+what makes rename and delete work on them with no special case, and `tests/test_director_panel.py`
+pins `DIRECTORS` to exactly two readings in the file, its declaration and the seed. **Seeding is
+keyed on the FOLDER not existing**, because that is the only state meaning "never used": deleting
+every direction leaves the folder, so a removed one stays removed. Deleting the folder by hand is
+therefore the documented way to get the seven back, and the only way, on purpose.
 
-`h3ir/contract.py` is the compiler's statement of everything a client has to agree with it about,
+`OpenH3IRDirector` takes one input, `profile`, and hands down one `H3IR_DIRECTOR` bundle. Main's
+`director` socket is optional, and a graph without the node steers exactly as it always has. **That
+absence is the default and it is load-bearing**, so anything that makes the node's presence matter to
+a graph that does not have one is a bug. There is no `none` on it for the same reason: the node IS
+the choice, and unplugging it is the absence of the only one rather than a third state.
+
+### The Setup panel
+
+`web/setup.js`. Five rules on it are not preferences, and each has a defect planted for it in the
+falsification run.
+
+**The panel never guesses an address, and a dropped node makes no network call at all.** It once
+offered four addresses people commonly run a language model on and checked them the moment a node
+was dropped. A port is configurable, so that was four guesses, confidently wrong for anybody who
+changed one, and it was the only thing in the pack that reached the network without being asked.
+Both are gone, along with the caret that opened the list, the `use it` button and the four messages
+that served them. `tests/test_setup_panel.py::test_a_fresh_node_makes_no_network_call_at_all` reads
+every call site of the two language model routes and holds them to the two methods a person presses.
+
+**The top field is `endpoint` and the bottom one is `runs at`.** The panel's own messages say
+endpoint in every one of them, so the label was the one place disagreeing with the rest of it. It is
+never "openai endpoint": somebody running Ollama on their own machine reads that as needing an
+account with OpenAI. That fact lives in the group's quiet line, where it is a fact about a protocol
+rather than a claim about who you buy from.
+
+**`server` empty means here and an address means there, and that IS the control.** The bottom row's
+control was two rows, `in this ComfyUI` and `on another machine`, and they were never a pair: the
+first is a complete answer, the second is the beginning of a question, and clicking it could not
+change anything because there is no third thing to set. One labelled field replaced them, with a
+line under it that changes with the state and a `clear` drawn only while there is something to
+clear.
+
+**Every field carries a label drawn inside its own row.** A placeholder is gone at the first
+keystroke and the field is anonymous from then on. The grey address in the address field is an
+EXAMPLE; the word `address` beside it is the label. The guard reads the row as a balanced expression
+rather than searching the whole file, because the weaker version passed while the address label was
+deleted: the same word labels a field in the bottom row's control.
+
+**The credential is never a widget value.** Widget values go into the saved workflow and into the
+graph inside every rendered video, and people share workflows by dropping a picture into a chat. It
+lives in `user/default/openh3ir/llm/keys.json` and `compiler.endpoint_key` reads it from there, so
+the test and the real compile take the same path to the same credential. Measured on the canvas: with
+a key set, neither the serialized workflow nor the API-format prompt contains it. The guard checks
+WHAT is written to a widget, not which widget: the first draft only looked at the widget's name and
+planting `this.w.llm_model.value = key` walked straight past it.
+
+**`installed` is read before `ok`.** The vision route answers `installed: false` together with
+`ok: false`, so a panel that reads `ok` first paints a red "vision off" about a model nobody asked.
+
+**The user cannot drag the height, and the height is not a constant.** Those are two different
+things and the first is the one the design asks for. The three quiet lines under the headings reflow,
+so the content is a different height at every width: 442 at 520 and 481 at 430, and 495 at 430 with
+the longer "compiling elsewhere" lead. A single constant has to be the largest of those, which leaves
+53 pixels spare at the width the node opens at. A draft parked them above the two headings and they
+read as a hole in a finished panel. `fit()` measures instead, so the board is tight at every width
+and `onResize` still puts back whatever it last measured.
+
+**`fit()` asks for `needs + chrome` and never for a correction to its own last request.** Setting the
+node's size makes the frontend lay the widget out again, which comes straight back into `fit`, so
+anything that adds to its own last number compounds. Measured: a draft that did walked the node to
+minus fourteen hundred pixels in four frames. `chrome` is what the frontend's wrapper keeps out of
+whatever a DOM widget is given, 16 pixels on the version this was measured against, and it is learned
+each pass rather than written down.
+
+**No backtick may appear inside the CSS block.** It is one template literal, so a pair in a comment
+ends the string and the file stops parsing. Measured: it took the whole panel off the canvas and
+`node --check` passed the file. Importing the module is what catches it.
+
+### The routes a panel can ask
+
+`web_api.py` registers five on ComfyUI's own server. Two are the media tray's; three are for the
+Setup node's panel, and all three report rather than decide -- nothing in them writes a widget, and
+the node re-resolves everything at queue time from the values on the canvas.
+
+| route | what it answers |
+|---|---|
+| `POST /openh3ir/upload` | one dropped file onto the tray, and what to show for it |
+| `GET /openh3ir/probe` | whether a file a saved tray names is still on this machine |
+| `GET /openh3ir/compiler` | `state` is `ok`, `absent` or `broken`, the version, and what the environment would give |
+| `POST /openh3ir/llm/models` | `{url}` in; liveness, every id, `choose_from`, and `also_known_as` out |
+| `POST /openh3ir/llm/vision` | `{url, model}` in; `ok` true, false, or **null** out |
+
+Three things about those three that are not obvious and are each a measured fact.
+
+**`choose_from` is shorter than `ids` on a real vLLM, and WHICH name survives is a stated rule.**
+`--served-model-name` publishes one set of weights under several ids and gives every entry the same
+`root`. Offering both would be the panel inventing a decision, and the person picking one has no way
+to know the two are the same file. `compiler.one_name_per_checkpoint` groups by `root` and keeps the
+first id in the group whose `id` is not its own `root` -- that id is a name somebody typed into
+`--served-model-name`, where `root` is only where the weights came from. Nothing named means nothing
+to prefer, and there the server's own order stands. Where entries carry no `root`, as on Ollama,
+every id is its own model, which can only offer more choice and never merge two that really are two.
+
+**The survivor is always an `id` and never a `root`, and that is correctness rather than taste.**
+Whatever a person picks goes straight back to the server as `model`. A `root` is not promised to be
+a name the server answers to: vLLM sets it from the model path, so a server started from a local
+directory has a filesystem path there with no route behind it. `also_known_as` maps each survivor to
+the names it stands in for, so a panel can say so beside the row instead of leaving somebody to
+wonder where the id they typed last week went.
+
+**`ok` on the vision route has three values and `null` is not a failure.** No model list on any of
+these servers reports vision, so sending a picture is the only way to find out, and a request that
+comes back refused is not automatically an answer about vision. Measured against a live vLLM: asking
+about a model the endpoint does not serve answers `HTTP 404: The model does not exist`, and the first
+draft of that route reported it as "it cannot read a picture, pick one with a vision tower". Somebody
+reading that goes looking for a vision model to replace one that was never there. Only 400, 415 and
+422 produce a verdict now; 404, 401, 403 and everything else answer `null` and say what really
+happened.
+
+**Everything in them that touches a network runs off the event loop.** ComfyUI serves its whole
+frontend from one aiohttp loop and the compiler's client is blocking `httpx`, so calling it inline
+would freeze the canvas -- for everybody on that server -- for as long as a language model takes to
+answer. `run_in_executor` is what keeps a slow endpoint a slow button rather than a hung ComfyUI.
+
+
+## What crosses to the compiler, and how drift is made loud
+
+The compiler publishes a contract and this pack holds a snapshot of the one it was built against.
+The section below is the shared half of both maintainer documents: the compiler's copy says the same
+things from the other side, and neither repository can test the other's. Read it before changing
+anything either half can see.
+
+the compiler's `h3ir/contract.py` is the compiler's statement of everything a client has to agree with it about,
 and it is the answer to a problem the two halves of this repository are about to have: they ship to
-two audiences, they are becoming two repositories, and a test that opens the other half's source
-file and reads it as text cannot exist after that.
+two audiences, they are two repositories, and a test that opens the other half's source file and
+reads it as text cannot exist.
 
-**The pack becomes an all-in-one, so IN-PROCESS is the ordinary case.** A ComfyUI user installs the
-pack, points it at their own language model, and works: no service to start, no port, no second
-process. The compiler runs in the same Python ComfyUI runs, out of the installed `open-h3-ir`. HTTP
-stays for a compiler on another machine and stops being the normal way in. The two are still
-installed separately and still drift, which is exactly why the contract is not an HTTP thing --
-in-process there is no round trip to reveal a mismatch at all.
+**The pack IS an all-in-one, and IN-PROCESS is the ordinary case.** A ComfyUI user installs the pack,
+points it at their own language model, and works: no service to start, no port, no second process.
+The compiler runs in the same Python ComfyUI runs, out of the installed `open-h3-ir`. HTTP stays for
+a compiler on another machine and is no longer the normal way in. The two are still installed
+separately and still drift, which is exactly why the contract is not an HTTP thing -- in-process
+there is no round trip to reveal a mismatch at all.
+
+**One field on the Setup node decides which, and there is no fallback between them.** Empty means
+here; an address means there. `contract.the_compiler` turns that field into a `Half`, which carries
+what to call that compiler, how to ask it what it takes, and what a person does to update it. Every
+sentence in `differences()` is written off that object, because the same difference has two fixes and
+a message telling a ComfyUI user to restart a service they never started is the wrong-message failure
+this pack exists to prevent.
+
+**The language model's address is on the node now.** It used to be `H3IR_LLM_URL` on a service, and
+there is no service to set it on. The environment variable still works for somebody who exports it
+before ComfyUI starts, and the report says so when a value came from there, because a setting nobody
+can see on the canvas is one somebody spends an afternoon looking for. Which model is settled on the
+pack's side rather than left to the compiler, for the same reason: the compiler's own refusal to
+guess between several models names an environment variable, and this pack's names a field.
 
 **Read off the authority wherever there is one.** The roles come from `Role`, the profiles and the
 camera table from `director.py`, the ceilings from `grid.py` and `shots.py`. Two lists are literals
-and both are pinned by `tests/test_contract.py` from this side, where the thing they describe is
+and both are pinned by `the compiler's `tests/test_contract.py`` from this side, where the thing they describe is
 importable: the wire field names, which live on pydantic models `contract.py` may not import because
 a client runs it inside ComfyUI's Python; and the refusal codes, which are raised across two files.
 
@@ -275,7 +278,7 @@ and that default cost this project a real bug: see below.
 
 #### The seven directors are still written down twice, and the copy is now generated
 
-`h3ir/director.py` is the authority. The pack's `web/contract.data.js` carries the copy, for the reason
+`h3ir/director.py` is the authority. `web/contract.data.js` carries the copy, for the reason
 it always did -- the pack may be talking to another machine, and a text box that needs a running
 service before it can show you a paragraph is empty exactly when somebody is trying to write in it.
 
@@ -286,19 +289,19 @@ regenerates both copies and compares them byte for byte. So the instruction that
 *editing `h3ir/director.py` is not finished until `director.js` says the same words* -- is now:
 
 ```bash
-h3ir contract       > contract.json          # run in the node pack's repository
+h3ir contract       > contract.json
 h3ir contract --js  > web/contract.data.js
 ```
 
 Eleven thousand characters of prose maintained by hand in two languages is drift with a schedule.
-After the split that test runs in the pack's repository against the `open-h3-ir` it depends on,
-which is a better comparison than a sibling working tree: it holds the pack against the released
-compiler.
+That test runs here, against the `open-h3-ir` this pack depends on, which is a better comparison
+than a sibling working tree: it holds this pack against the released compiler. Regenerating means
+having a compiler installed and running the two commands above from the repository root.
 
 #### Assert about the payload, never about the source text
 
 Two of the three cross-boundary tests were guarding the wrong hop, and one of them had been wrong
-for its whole life. `tests/test_swap_roles.py` asserted that `nodes.py` contains the line
+for its whole life. a test in the compiler's suite asserted that `nodes.py` contains the line
 `extra["replaces"] = slot.replaces` and that `AssetIn` declares a field called `replaces`. Both were
 true. In between them, `h3ir_client._asset_facts` copied four keys out of `extra` into the request
 and this was not one of them.
@@ -320,13 +323,19 @@ Two ways to get the live contract, and the choice is the caller's:
 
 | where the compile happens | how to ask |
 |---|---|
-| the same Python, from the installed package | the pack's `contract.installed_contract()` |
+| the same Python, from the installed package | `compiler.installed_contract()` |
 | a service on another machine | `h3ir_client.fetch_contract(server)` |
 
 **Never merge them or fall back from one to the other.** Reading the local package's contract while
 compiling against a remote service compares this machine's version to another machine's work, and
-refuses graphs that are fine. The compile node talks HTTP today, so it asks over HTTP, and a test
-fails if it starts reading the local one.
+refuses graphs that are fine. `contract.the_compiler` picks one to match the compile path and hands
+back a `Half` that can only ask that one.
+
+The test that guards this used to assert that the string `installed_contract(` was absent from
+`nodes.py`, which was true right up until the node legitimately needed both. It watches now: both
+sources are replaced with counters and each half is driven for real. A check on source text cannot
+tell "calls the wrong one" from "mentions the right one", and this repository has already shipped one
+test that read source text and was green while the thing it guarded was broken.
 
 **The compiler import is lazy, and stays lazy.** The old rule was "the pack imports nothing from
 `h3ir`", which was right while the nodes only spoke HTTP and is wrong for an all-in-one. What
@@ -337,29 +346,45 @@ fastapi, uvicorn, pydantic and tiktoken, which have no business being pulled int
 on every start for a graph that may never compile. `installed_contract` answers None for absent,
 broken and half-installed alike, because a client never fails on the CHECK.
 
-#### What an in-process caller does NOT get for free
+#### The in-process path builds the brief itself, and that choice is tested rather than argued
 
 Measured, with fastapi and pydantic blocked: every compiler module imports except `service.py`.
 That one holds `_to_brief`, the only conversion from a request into a `Brief`, and the eleven
 refusals it raises along the way -- role resolution, the unknown-role message, the soundtrack
 pairing, the upload checks.
 
-So an in-process caller has two options and both cost something. Reuse that conversion and fastapi
-comes into ComfyUI's Python with it. Build `models.Brief` and `models.AssetRef` directly and the
-field names are checked by Python at call time, which is loud and free, but `role_stated` and the
-pairing rules become the caller's to get right -- and `role_stated` is silent when it is wrong,
-because mode inference reads it.
+So there were two options and both cost something. Reuse that conversion and fastapi comes into
+ComfyUI's Python with it. Build `models.Brief` and `models.AssetRef` directly and the field names
+are checked by Python at call time, which is loud and free, but `role_stated` and the pairing rules
+become the caller's to get right -- and `role_stated` is silent when it is wrong, because mode
+inference reads it.
 
-This pack is well placed for the second option: it states every role explicitly and never infers
-one, so `role_stated` is always true for it and the unknown-role refusal is pre-empted by the
-contract check. A caller that under-specifies is not. **`ROLE_OF_THE_FIELD_LISTS` is published in
-the contract for this reason**: the field lists describe a `POST /v1/briefs` request and NOT the
-dataclasses, and the two are similar enough to be mistaken for each other by somebody building the
-all-in-one.
+**The second was taken, and here is what decided it.** Most of `_to_brief` is about uploads, and an
+in-process compile has none: the files are on the same disk, because this pack put them there. What
+is left is small enough to state, this pack states every role explicitly so `role_stated` is always
+true for it, and the unknown-role refusal is pre-empted by the contract check. Measured on this
+checkout: `import h3ir.compile` costs 0.06 seconds and loads none of fastapi, uvicorn, pydantic or
+tiktoken, so all four stay installed and never loaded.
+
+**What replaces the argument is a test.** `tests/test_in_process.py` runs one request through both
+conversions -- `service._to_brief` and `compiler.brief_from_payload` -- and compares the two briefs
+field by field, for every job a picture can have and for a graph with nothing in the tray. fastapi
+is absent from a user's ComfyUI and present in this repository's test environment, which makes this
+the one place both can run side by side. `_as_the_service_answers` is held against
+`service.get_prompt` and `service._envelope` the same way.
+
+**`ROLE_OF_THE_FIELD_LISTS` is published in the contract for this reason**: the field lists describe
+a `POST /v1/briefs` request and NOT the dataclasses, and the two are similar enough to be mistaken
+for each other by somebody working on the all-in-one.
+
+**An unknown key is refused on this path too.** `_BRIEF_KEYS` and `_ASSET_KEYS` in `compiler.py` are
+the in-process spelling of `extra="forbid"`, and they exist because pydantic's silent drop cost this
+project a real bug once. A conversion that read the keys it knows and ignored the rest would put
+that bug straight back on the path that has no wire to catch it.
 
 #### Two halves at different versions have to keep working
 
-The pack's `contract.py` decides what a difference costs, and it decides it against **what this graph is
+`contract.py` decides what a difference costs, and it decides it against **what this graph is
 sending**, not against everything the pack can do. A pack that knows about `replaces` talking to a
 compiler that does not is perfectly good for every brief that replaces nobody, and refusing those
 would be breaking working setups to protect a feature they are not using.
@@ -382,125 +407,126 @@ request, including all four about who a picture replaces -- were invisible to it
 user through a branch that says "the service rejected the request".
 
 They are published now, `h3ir_client.REFUSED_AS_ASKED` gives the class one branch, and
-the pack's `tests/test_comfyui_node.py` reads its list from the shipped contract instead of from
-this repository's source, which is what carried it across the split.
+`tests/test_comfyui_node.py` reads its list from the shipped contract instead of from the
+compiler's source, which is what carried it across the split.
 
-## Known gaps, honestly
 
-- **The committed sample media cannot be rebuilt.** The two comparisons in `docs/media/` were
-  produced by hand. Deferred on purpose, to be done only when the compiler improves enough to be
-  worth re-shooting the samples, and only if it is. The risk being accepted is that the clips
-  silently become evidence of an older version while the front page still claims a difference.
+## ComfyUI frontend mechanics, measured rather than assumed
 
-  The recipe survives without a script, which is why deferring is safe: both compiled briefs ship
-  beside the clips, both reference plates ship, the dial command is in the README, and the seed and
-  render settings are in the commit that added them.
+Four of these cost a rebuild of the node surface to discover. They are recorded so nobody re-derives
+them, and each has a test in `tests/test_comfyui_schema.py` that fails if the surface stops respecting
+it. Measured against `comfyui_frontend_package 1.48.7` and `comfy_api/latest/_io.py`.
 
-  If it is ever written it cannot live in CI, because it needs ComfyUI with H3 loaded and a live
-  endpoint. And it would not reproduce the same clips: renders are not identical across model or
-  driver versions, so the check is whether the claim still holds, not whether the pixels match.
+- **`advanced` is not a hide.** The per-node expander exists only under Nodes 2.0 and is gated on the
+  setting `Comfy.Node.AlwaysShowAdvancedWidgets`. Under the legacy canvas renderer it does nothing at
+  all. Design as if every input is visible; treat the collapse as a bonus.
+- **A label and its value share one row of about 38 characters.** So a long display name makes both
+  unreadable. This is why every label in the pack is one or two words.
+- **A multiline STRING with no placeholder prints its own input id** on the canvas:
+  `addMultilineWidget` calls `createMultilineInputElement(default, placeholder || name)`. On a
+  multiline widget the placeholder is the only label there is, so it has to be the label and the
+  example at once and its first line has to stand alone under truncation. A **single-line** STRING's
+  placeholder is not drawn at all on the legacy canvas, so there the display name carries everything.
+- **Autogrow socket labels come from `names[ordinal]`, or from `prefix + ordinal` zero-based, and they
+  overwrite whatever the template declared.** `autogrowOrdinalToName` returns
+  `{name, display_name: s}` and `s` wins. So `TemplatePrefix` gives you `reference_0` on the canvas no
+  matter what the template's `display_name` says, and `TemplateNames` is the only way to get one-based
+  readable labels. Ids with a space in them (`pictures.picture 1`) round-trip through the API format
+  and the workflow save without trouble; verified by running one.
+- **The frontend already supports several inputs per grown item** (`inputSpecs` is a list and
+  `ensureWidgetForInput` runs when its length is not 1), but the Python side takes a single template
+  input and `_expand_schema_for_dynamic` reads only the first. That is the mechanical reason the
+  picture notes are one positional block and a clip's role lives on a satellite node, not a preference.
+- **An AUDIO is a Mapping, not necessarily a dict.** Load Video (Upload) hands out a `LazyAudioMap`
+  that shells out to ffmpeg on first key access. `isinstance(audio, dict)` refuses it.
+- **A DOM widget's wrapper follows `widget.width`, and the frontend rewrites that on every value
+  change.** The Vue side patches the wrapper's inline style each render from a node layout pass, and
+  what that pass computes is the node's *content* width, not the node box. Measured: choosing a
+  director set `width` to 238 on a node that was still 480 wide, the panel's wrapper went to 218px,
+  and the name field was squeezed to eleven pixels -- `Denis Villeneuve` drawn as `De`. It never
+  recovered at any node size, and no `computeSize` on either the widget or the node changes it,
+  because neither is what the wrapper reads. `width` unset is the state a widget starts in and the
+  one that renders full-bleed, so a board that fills its node holds it there:
+  `Object.defineProperty(w, "width", { get: () => null, set: () => {} })`. The media tray never hit
+  this because it pins its node to one size; anything resizable has to say it.
 
-- **The style-LoRA registry is read but not usable end to end. `--lora` crashes, both ways.** TODO,
-  deliberately deferred: proving this out needs the application that consumes it to exist first, so
-  it can be tested against real weights and a real render rather than against a placeholder.
 
-  What works: the registry loads a folder correctly and `h3ir loras` reports id, triggers, strength
-  bounds, variants, conflicts and the author prose. `GET /v1/loras` serves it.
+## Proving a change is live in a running ComfyUI
 
-  Two separate defects behind that, and they fail differently:
+**A ComfyUI install holds a COPY of this pack, not this checkout.** `custom_nodes/openh3ir` is a
+directory somebody copied there; nothing links it to the tree you are editing unless somebody made a
+link, and `dir /AL` (or `ls -l`) is how you find out rather than assuming. So a change you make here
+is live in a running ComfyUI only after you have put it there.
 
-  ```
-  # variant mismatch, raised as an internal invariant instead of told to the caller
-  h3ir compile "a fox in tall grass" --lora handpainted-anim-v2
-  -> CompilerInvariantError: W11-lora-variant: handpainted-anim-v2 is trained for
-     ['ref2va'] but this request routes to the fl2va checkpoint
+The two halves fail differently, and the difference is what makes this a trap rather than an
+inconvenience:
 
-  # variant matches, and the trigger splice produces text the validator rejects
-  h3ir compile "the car rolls in" --image plate.jpg --lora handpainted-anim-v2
-  -> CompilerInvariantError: R16-style-opening-malformed: a spliced clause keeps its
-     capital mid-sentence ('with Hi'):
-     'The target video is in hndpntd_anim_v2 style with High-contrast automotive...'
-  ```
+- **`web/*.js` is served from that copy on every page load.** So fetching
+  `/extensions/openh3ir/tray.js` and diffing it against the tree is a real check of what the browser
+  is running -- but a match proves only that the two files are equal right now, which is also what
+  you see when somebody synced it an hour ago. It is evidence about the file, never about a link.
+- **The `.py` files are imported once, at ComfyUI startup.** A copied-in change does nothing until
+  the server restarts. This is the half that goes stale silently: the panel offers a new option
+  because the JavaScript is current, the user picks it, and the queue refuses it because the Python
+  is five days old.
 
-  The first is the validator being **right** and the handling being wrong: asking for a ref2va-only
-  style on a request that routes elsewhere is a real user error and deserves a sentence saying so,
-  not an invariant crash. The second is a genuine text bug: the trigger is spliced into the style
-  opening without lowercasing what follows.
+Measured on 2026-08-20: the served `tray.js` matched this checkout byte for byte while `tray.py` in
+the same install was five days behind, and the conclusion drawn from the first fact was that the
+whole pack was live.
 
-  And the part nobody has built at all: **nothing matches a request's own words to a registered
-  style.** The owner's intent was that mentioning a look in plain language pulls the LoRA in and says
-  so. Today only an explicit id does anything, and `"hand-painted animation look"` in the request
-  text is ignored. `docs/design.md` and `docs/calling-the-api.md` both expose the surface, so an
-  agent will discover styles and try to use them before this is fixed.
+**The cheap read-out is the pack's own refusal.** Set the tray to whatever the change makes possible
+and queue the graph. If the running Python predates the change, the node refuses it with the OLD
+table's own sentence, naming the options it still believes in, and the failure lands on the Media
+node before a model is loaded, so it costs no GPU and no minutes. A refusal quoting the state you
+just left is the running process telling you which file it is holding, which is the same discipline
+as reading the artifact back instead of trusting the code that wrote it.
 
-- **What a video EDIT can and cannot hold, measured on the released weights.** Twelve renders on
-  a 5090, 20 steps, `res_multistep`, against a 124-frame source clip and the same
-  clip as `<Video 1>`. H3's ref2va path takes the reference video as conditioning latents beside a
-  fresh empty target latent — it is a re-generation, not an in-place edit — and that is visible in
-  the numbers:
+**And there is one that costs no queue at all: ask the server for its own node table.**
+`GET /object_info/<NodeId>` is built from the `.py` the process imported at startup, so it is the
+schema the canvas is actually drawing. Diff it against `define_schema` in the tree and a stale import
+is one read away, before anybody opens a browser.
 
-  | what survives | how it measures |
-  |---|---|
-  | the subject's identity, and a requested change to it | the edit lands; a blue shirt asked for is blue |
-  | the timing of the action | motion-curve correlation 0.58-0.80 against 0.06 for an unrelated clip |
-  | the exact framing over time | NOT held. Nearest-source-frame agreement 0.20-0.27 against 1.00 for the clip against itself and 0.14 for an unrelated clip |
+Measured on 2026-08-21, and it is the same trap from the other end: `nodes.py` in the install
+was byte-identical to this checkout -- every file was, `web/` included -- while
+`/object_info/OpenH3IRDirector` answered with a twelve-field schema from an earlier session, a
+`director` combo with `none` in it plus `moves`, `avoids` and a save/load `library`, none of which
+exist in the file either copy holds. Equal files on both sides of a copy and a running process three
+hours behind them. The `.pyc` timestamps under `custom_nodes/openh3ir/__pycache__` said the same
+thing and are the other cheap tell: older than the `.py` beside them means the import is stale.
 
-  So "the same clip with one thing changed" is honest about the beats and the subject, and is not a
-  frame-locked edit. A brief that promises a frame-for-frame match is promising something these
-  weights do not do. The two gauges and their controls are worth rebuilding rather than trusting a
-  single number: the first gauge tried here correlated greyscale frames directly and scored 0.90 on
-  a SHUFFLED pairing, because the scene barely moves and the background is most of the picture.
 
-- **A video card reads three frames, so it cannot name a camera move.** `camera` on the card is the
-  VLM's plain-words reading of how the framing changes across those frames ("the framing tightens
-  slightly on the subject"), and never a member of `CAMERA_TYPES`: three stills cannot separate a
-  Push In from a Zoom In, or a Pan from a Truck, and a confident wrong answer about a clip the
-  writer is told to preserve is worse than none. When it comes back `unknown` the ask says so out
-  loud and forbids a camera sentence, because silence measured as "static camera" in 3 of 4 seeds.
-  The extension point is a real camera classifier over more frames; the honest floor is here.
+## Falsifying a guard
 
-- **Audio references have no transcript source wired in.** `analyse_audio` accepts a transcript
-  and the plumbing for it exists, but nothing calls whisper yet. Until it does, an attached audio
-  reference is described from the caller's note alone. This matters more than it looks: the
-  tokenizer emits `"<Audio j>: "` and nothing else, so the IR text is the *only* channel by which
-  the conditioning encoder learns what that audio is. Wire whisper before shipping audio refs.
-- **Video references now sample real frames**, at 10/50/90% of the clip, cached on content hash
-  **and** on the fractions. `ffmpeg`/`ffprobe` are hard runtime dependencies of video references, not
-  conveniences. The analyser raises rather than producing a card. Audio still has no transcript
-  source wired in, so an attached audio reference is still described from the caller's note alone.
-- **`refine()` re-runs the whole compile.** The cache keys make a prose-only refinement cheap in
-  principle, but the fast path is not implemented. It re-analyses nothing (cards are cached) but
-  does redo the beat sheet and all prose.
-- **The eval suite is six briefs.** Enough to catch the regressions we have seen; not a broad
-  quality benchmark. Add briefs when a new failure mode appears, not preemptively. It is also the
-  only thing that found the mode-split bug below, and it found it the first time it was ever run
-  end-to-end on the write-first path. Five of six briefs were falling back and no single-brief test
-  could see it, because the one brief anybody had been testing by hand was the ref2va one.
-- **One prompt per mode, and check that when you add a stage.** `compose.v2.txt` carries the
-  full-reference guide; `compose_base.v1.txt` carries the base guide. `compose_prompt=None` picks by
-  mode and that is the right default. Passing an explicit name overrides the choice for BOTH modes,
-  which is what you want for an A/B and never what you want in production.
-- **Thinking ON costs about 45 s on the planning call** versus ~5 s off. Whether it earns that is
-  an open A/B, not a settled question; the eval loop is how to answer it.
-- **`camera_style: "prose"` renders no camera sentence at all.** It exists as the A/B arm for
-  "does the closed vocabulary matter"; it is not a finished alternative rendering. Do not ship it
-  as a user-facing option until the A/B is run and the losing arm is either fixed or removed.
-- **LoRA weights are never loaded here.** This layer plans the trigger injection and records what
-  was chosen; patching the graph is the graph owner's job.
-- **`compose.v3.txt` is written but not the default.** It differs from v2 in exactly one paragraph:
-  the "decide the edit" instruction, which in v2 ends *"and it is the worst outcome available"*:
-  invented severity on a discretionary call, the same fault the validator audit removed from the
-  rules. v3 states the spec's sentence instead. It is not the default because the arm5/arm6 pair
-  (same pipeline, direct vs not) was generated against v2 and flipping the default mid-comparison
-  changes two variables at once. Switch with `--compose compose.v3.txt`, score it, then promote it.
+**Falsify every test you write. It is not ceremony. It is what distinguishes a test from a
+comment.** Break the code the test covers, on purpose, and watch it go red.
 
-## The acceptance comparison
+**And a test that has never been seen failing is a test nobody has verified.** This suite shipped one
+that was green for its whole life while the field it guarded was dropped in transit, so every check
+holding the compiler and the pack together has a defect written for it in
+`research/contract_falsification.py`: it plants the defect, proves the defect is live, runs the test
+that claims to catch it, and puts the file back. Run it on a clean tree and every case must go red.
 
-```bash
-h3ir acceptance --image-a character.png --image-b creature.png --out acceptance/
-```
+The case count is deliberately not written here. It moves every time anybody adds a guard, the run
+prints it, and a stale number in this file reads as five cases having gone missing. What the run must
+report is `0 green, 0 broken`, and `git status` must be clean afterwards.
 
-Writes five prompt files, a wiring manifest for each, and a README explaining what each outcome
-would mean. It does not submit anything. Arm D is the control that decides whether the labels
-bind or the position does. Do not drop it, because without it a difference between arms A and B
-has two explanations.
+**It reports three outcomes, not two, and that distinction is the file's second draft.** RED is a
+guard that fired. GREEN is a guard that did not. BROKEN is a case that never ran -- the anchor
+moved, the write did not land, the edit made the module unimportable, or the test it names no
+longer exists. The first draft printed the same thing for GREEN and BROKEN, and two cases hid in
+that: one named a test that had been renamed, and one planted an unbalanced parenthesis. pytest
+exits non-zero for a `SyntaxError` and for an unknown node id exactly as it does for a failing
+assertion, so both printed RED for months of nothing. **Anything that plants defects has to prove it
+planted them before it is allowed an opinion about the guard.**
+
+Two traps it records rather than works around, because anything editing source in a loop will hit
+them:
+
+  * **Python validates a cached `.pyc` on (mtime, size) and mtime has one-second resolution.** A
+    defect exactly as long as what it replaces, planted within a second of the restore before it,
+    runs against the OLD bytecode. Five cases reported a guard that does not fire before
+    `__pycache__` was wiped between them.
+  * **`python -O` strips `assert`.** The first draft checked its anchors with one, so under `-O` a
+    moved anchor became a silent no-op: nothing was edited, the test passed on untouched source,
+    and the case printed GREEN. Nothing in that file uses `assert` any more.
+
